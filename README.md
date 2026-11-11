@@ -40,7 +40,7 @@ New York's rule 9 NYCRR 123.10(d)(5) limits recording customer personal informat
 
 ## Setup
 
-1. Create a Firebase project. In Authentication, turn on **Anonymous** and **Google** sign-in, and add `markemuniz.github.io` under Authorized domains.
+1. Create a Firebase project. In Authentication, turn on **Anonymous** and **Google** sign-in, and add `retailoperations-tta.github.io` under Authorized domains.
 2. Create a Firestore database and paste `firestore.rules` into its Rules tab.
 3. Paste the web app config into `FIREBASE_CONFIG` near the top of the second script in `index.html`. Keep `MANAGER_EMAILS` the same as the list in the rules.
 4. On each store computer, open the page and pick the store. A link like `?store=usq` picks it automatically.
