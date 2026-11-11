@@ -11,7 +11,7 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     function signedIn() { return request.auth != null; }
-    function managerEmails() { return ['retailoperations@thetravelagency.co']; }
+    function managerEmails() { return ['retailoperations@thetravelagency.co', 'mark.muniz@thetravelagency.co', 'victoria.mahon@harbourcommunity.com']; }
     function isManager() {
       return signedIn()
         && request.auth.token.email_verified == true
