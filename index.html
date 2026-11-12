@@ -1033,7 +1033,7 @@ const BAN_REASONS = [
   ['other', 'Other']
 ];
 
-const APP_VERSION = '1.7.1';
+const APP_VERSION = '1.7.2';
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const DEDUPE_MS = 120000; // same card again within 2 minutes is counted once
 const BAN_WAIT_MS = 1500; // how long a scan waits on the ban list before showing
@@ -1263,8 +1263,8 @@ let current = null, clearTimer = 0, scanSeq = 0;
 async function lookupBan(keys) {
   const ids = [keys.person, keys.alt].filter(Boolean);
   if (!ids.length) return { state: 'skip' };
-  if (!cloud.db || !cloud.user) return { state: 'offline' };
-  const { fs, db } = cloud;
+  const { fs } = cloud, db = cloud.user ? liveDb() : null;
+  if (!db) return { state: 'offline' };
   const res = await Promise.allSettled(ids.map(id => fs.getDoc(fs.doc(db, 'idBanKeys', id))));
   const ok = res.filter(x => x.status === 'fulfilled').map(x => x.value);
   const hit = ok.find(s => s.exists() && s.data().active);
@@ -1500,22 +1500,49 @@ function record(r, v, method, keys) {
 /* ---------------- Firebase ---------------- */
 const cloud = { state: 'off', fs: null, au: null, app: null, db: null, auth: null, user: null, inflight: 0, err: '' };
 let pending = ls.get('pending', []);
-function enqueue(entry) { pending.push(entry); ls.set('pending', pending); flush(); }
+const sending = new Map(); // scan id -> the connection it was sent on
+const newQid = () => Array.from(crypto.getRandomValues(new Uint8Array(20)), b => 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[b % 62]).join('');
+function enqueue(entry) { entry.qid = newQid(); pending.push(entry); ls.set('pending', pending); flush(); }
+/* A scan stays in this browser's queue until Firebase confirms it, so a
+   dropped connection or a refresh can't lose it. Each scan keeps the same
+   record IDs every time it's sent, and the rules refuse to overwrite a
+   record, so sending it twice can't count it twice. */
 function flush() {
-  if (!cloud.db || !cloud.user) { renderCloud(); return; }
-  while (pending.length) {
-    const e = pending.shift(); ls.set('pending', pending);
-    cloud.inflight++;
-    writeEntry(e).then(() => { cloud.inflight--; cloud.err = ''; renderCloud(); if (!cloud.inflight) wipeManagerCache(); })
-      .catch(err => { cloud.inflight--; cloud.err = (err && err.code) || 'save failed'; console.warn('ID Check save failed', err); renderCloud(); });
+  const db = cloud.user ? liveDb() : null;
+  if (!db) { renderCloud(); return; }
+  let changed = false;
+  for (const e of pending) {
+    if (!e.qid) e.qid = newQid(); // queued by an older version
+    if (sending.has(e.qid)) continue;
+    e.tries = (e.tries || 0) + 1; changed = true;
+    sending.set(e.qid, db);
+    writeEntry(e, db).then(errs => entrySent(e, db, errs));
   }
+  if (changed) ls.set('pending', pending);
+  cloud.inflight = sending.size;
   renderCloud();
 }
-function writeEntry(entry) {
-  const { fs, db } = cloud;
-  const e = Object.assign({}, entry), visit = e.visit, zip = e.zip; delete e.visit; delete e.zip;
+const RETRY_CODES = ['unavailable', 'deadline-exceeded', 'aborted', 'internal', 'cancelled', 'unknown', 'resource-exhausted'];
+function entrySent(e, db, errs) {
+  if (sending.get(e.qid) !== db) return; // it was sent again on a new connection; that send decides
+  sending.delete(e.qid); cloud.inflight = sending.size;
+  // When a resend is refused, the first send already saved it.
+  const real = errs.filter(err => !(e.tries > 1 && err && err.code === 'permission-denied'));
+  if (real.some(err => isDead(err) || RETRY_CODES.includes(err && err.code))) { renderCloud(); return; } // keep it; flush tries again
+  pending = pending.filter(x => x.qid !== e.qid); ls.set('pending', pending);
+  if (real.length) { cloud.err = (real[0] && real[0].code) || 'save failed'; console.warn('ID Check save failed', real); }
+  else cloud.err = '';
+  renderCloud();
+  if (!sending.size) wipeManagerCache();
+}
+// Resolves to a list of errors (empty when it all saved). Never rejects.
+function writeEntry(entry, db) {
+  try {
+  const { fs } = cloud;
+  const e = Object.assign({}, entry), visit = e.visit, zip = e.zip, id = e.qid;
+  delete e.visit; delete e.zip; delete e.qid; delete e.tries;
   const inc = fs.increment(1);
-  const scanRef = fs.doc(fs.collection(db, 'idScans'));
+  const scanRef = fs.doc(db, 'idScans', id);
   const dayRef = fs.doc(db, 'idDaily', e.day + '_' + e.store);
   const batch = fs.writeBatch(db);
   batch.set(scanRef, Object.assign({}, e, { ts: fs.Timestamp.fromMillis(e.at), savedAt: fs.serverTimestamp() }));
@@ -1528,20 +1555,36 @@ function writeEntry(entry) {
   if (zip && /^\d{5}$/.test(zip)) upd.zip = { [zip]: inc };
   if (e.result === 'deny') upd.denials = fs.arrayUnion({ id: scanRef.id, time: e.time, at: e.at, station: e.station, reason: e.reason, age: e.age, issuer: e.issuer });
   batch.set(dayRef, upd, { merge: true });
-  const saved = batch.commit(); // resolves once the server has it; offline writes wait in the browser
-  if (!visit) return saved;
+  const parts = [batch.commit()]; // resolves once the server has it; offline writes wait in the browser
   // Separate write, so counts still save even if the visit is refused.
-  const visitRef = fs.doc(fs.collection(db, 'idVisits'));
-  const vSaved = fs.setDoc(visitRef, Object.assign({
+  if (visit) parts.push(fs.setDoc(fs.doc(db, 'idVisits', id), Object.assign({
     at: e.at, ts: fs.Timestamp.fromMillis(e.at), savedAt: fs.serverTimestamp(), day: e.day, hour: e.hour, time: e.time,
     store: e.store, station: e.station, result: e.result, reason: e.reason, age: e.age, issuer: e.issuer,
     docType: e.docType, scan: scanRef.id, v: e.v
-  }, visit));
-  return Promise.all([saved, vSaved]);
+  }, visit)));
+  return Promise.allSettled(parts).then(rs => rs.filter(x => x.status === 'rejected').map(x => x.reason));
+  } catch (err) { return Promise.resolve([err]); }
+}
+/* Clearing the saved manager data in one ID Check tab makes Firebase shut
+   down the connection in every other ID Check tab in that browser. Spot a
+   shut-down connection and open a new one, so scans keep saving and ban
+   checks keep working. */
+const isDead = err => !!err && err.code === 'failed-precondition' && /terminated/i.test(err.message || '');
+function liveDb() {
+  const db = cloud.db;
+  if (!db) return null;
+  try { cloud.fs.writeBatch(db); return db; } // throws only when the connection was shut down
+  catch (err) { if (!isDead(err)) return db; } // some other problem: let the real call report it
+  if (wiping) return null;
+  try { cloud.fs.terminate(db).catch(() => {}); } catch (e) {} // let go of the dead one
+  cloud.db = makeDb(cloud.app);
+  for (const [id, d] of sending) if (d === db) sending.delete(id); // scans sent on it get sent again
+  console.warn('ID Check: the Firebase connection was shut down by another ID Check tab. Reconnected.');
+  return cloud.db;
 }
 function renderCloud() {
   const el = $('#cloud'); let txt = '', s = 'off';
-  const waiting = pending.length + cloud.inflight;
+  const waiting = pending.length; // includes scans on their way
   if (!FIREBASE_CONFIG) { txt = 'Saving is off until Firebase is connected'; }
   else if (cloud.state === 'error') { s = 'error'; txt = 'Can’t reach Firebase (' + cloud.err + ')' + (waiting ? ', ' + waiting + ' waiting' : ''); }
   else if (cloud.err) { s = 'error'; txt = 'Firebase refused a save (' + cloud.err + '). Check the rules.'; }
@@ -1566,8 +1609,9 @@ async function wipeManagerCache() {
   if (wiping || wipeBlocked || !ls.get('wipeCache', false) || !cloud.db || !cloud.app) return;
   if (!cloud.user || !cloud.user.isAnonymous) return; // nobody signed in yet, or a manager is back
   if (pending.length || cloud.inflight || scansBusy || Scan.active || !navigator.onLine) return; // try again later
+  const { fs } = cloud, db = liveDb(); // reconnects first if another tab shut this connection down
+  if (!db) return;
   wiping = true;
-  const { fs } = cloud, db = cloud.db;
   try {
     const synced = await Promise.race([fs.waitForPendingWrites(db).then(() => true), new Promise(res => setTimeout(() => res(false), 8000))]);
     if (!synced || pending.length || cloud.inflight || scansBusy || Scan.active || !cloud.user || !cloud.user.isAnonymous) return;
@@ -1802,6 +1846,7 @@ setInterval(() => {
   const u = cloud.user;
   if (u && !u.isAnonymous && S.store && mgrIdleMs() > MGR_IDLE_MS) { signOutMgr(); if (viewName() !== 'scan') location.hash = ''; }
   else wipeManagerCache(); // retry a wipe that had to wait
+  if (pending.length) flush(); // retry scans that haven't saved yet
 }, 30000);
 
 function toast(msg) {
@@ -1818,7 +1863,7 @@ const hourHead = h => (h % 12 || 12) + (h < 12 ? ' am' : ' pm');
 const BX = { list: [], keys: new Map(), at: 0 };
 async function loadBanIndex(force) {
   if (!force && BX.at && Date.now() - BX.at < 60000) return;
-  const { fs, db } = cloud;
+  const { fs } = cloud, db = liveDb();
   const snap = await fs.getDocs(fs.collection(db, 'idBans'));
   BX.list = snap.docs.map(d => Object.assign({ id: d.id }, d.data()));
   BX.keys = new Map();
@@ -1848,7 +1893,7 @@ $('#vFind').addEventListener('input', e => { clearTimeout(findTimer); findTimer 
 
 async function loadVisits() {
   if (!cloud.db || !isManager(cloud.user)) return;
-  const tok = ++VS.token, { fs, db } = cloud, col = fs.collection(db, 'idVisits');
+  const tok = ++VS.token, { fs } = cloud, db = liveDb(), col = fs.collection(db, 'idVisits');
   const find = normName(VS.find);
   $('#vRange').textContent = 'Loading…';
   let q;
@@ -1907,7 +1952,7 @@ async function openPerson(x) {
   $('#pSub').textContent = 'Loading…'; $('#pList').innerHTML = '';
   $('#pBan').hidden = !!banFor(x);
   $('#dlgPerson').showModal();
-  const { fs, db } = cloud, col = fs.collection(db, 'idVisits');
+  const { fs } = cloud, db = liveDb(), col = fs.collection(db, 'idVisits');
   try {
     const q = x.person ? fs.query(col, fs.where('person', '==', x.person)) : fs.query(col, fs.where('alt', '==', x.alt));
     const snap = await fs.getDocs(q);
@@ -1970,7 +2015,7 @@ $('#banForm').addEventListener('submit', async e => {
   } catch (ex) { err.textContent = 'Couldn’t save the ban (' + (ex.code || ex.message) + ').'; $('#bGo').disabled = false; }
 });
 async function saveBan(b) {
-  const { fs, db } = cloud, now = Date.now(), day = dayKey(new Date(now));
+  const { fs } = cloud, db = liveDb(), now = Date.now(), day = dayKey(new Date(now));
   const id = b.person || b.alt;
   const batch = fs.writeBatch(db);
   batch.set(fs.doc(db, 'idBans', id), {
@@ -1997,7 +2042,7 @@ $('#liftForm').addEventListener('submit', async e => {
   const b = liftBan; if (!b) return;
   $('#lfGo').disabled = true;
   try {
-    const { fs, db } = cloud, batch = fs.writeBatch(db);
+    const { fs } = cloud, db = liveDb(), batch = fs.writeBatch(db);
     batch.set(fs.doc(db, 'idBans', b.id), { active: false, liftedBy: cloud.user.email, liftedAtMs: Date.now(), liftNote: $('#lfNote').value.trim().slice(0, 300) }, { merge: true });
     if (b.person) batch.set(fs.doc(db, 'idBanKeys', b.person), { active: false }, { merge: true });
     if (b.alt) batch.set(fs.doc(db, 'idBanKeys', b.alt), { active: false }, { merge: true });
@@ -2071,7 +2116,7 @@ async function loadReports() {
   R.loading = true;
   $('#rRange').textContent = 'Loading…';
   try {
-    const { fs, db } = cloud;
+    const { fs } = cloud, db = liveDb();
     const from = R.range === 'all' ? '2000-01-01' : dayKey(start);
     const q = fs.query(fs.collection(db, 'idDaily'), fs.where('day', '>=', from), fs.where('day', '<=', dayKey(end)));
     const snap = await fs.getDocs(q);
