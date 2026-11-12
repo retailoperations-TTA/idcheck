@@ -1033,7 +1033,7 @@ const BAN_REASONS = [
   ['other', 'Other']
 ];
 
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.7.1';
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const DEDUPE_MS = 120000; // same card again within 2 minutes is counted once
 const BAN_WAIT_MS = 1500; // how long a scan waits on the ban list before showing
@@ -1787,12 +1787,20 @@ $('#gSignOut').addEventListener('click', () => signOutMgr(true));
 $$('[data-signout]').forEach(b => b.addEventListener('click', () => signOutMgr(true)));
 // Store computers are shared, so a manager left signed in gets signed out
 // after 15 minutes without using Visits, Bans or Reports.
+// Every ID Check tab in this browser shares one Google sign-in, so they share
+// one idle clock too. Otherwise a forgotten tab signs out a manager who is
+// busy in another tab, a minute or two after they sign in.
 let mgrLast = Date.now();
-function mgrTouch() { mgrLast = Date.now(); }
-['pointerdown', 'keydown'].forEach(t => document.addEventListener(t, () => { if (viewName() !== 'scan') mgrTouch(); }, true));
+function mgrTouch() { mgrLast = Date.now(); ls.set('mgrLast', mgrLast); }
+// Newest activity in any tab (a time in the future doesn't count)
+const mgrIdleMs = () => Date.now() - Math.max(mgrLast, Math.min(Number(ls.get('mgrLast', 0)) || 0, Date.now()));
+// Scrolling counts too, so reading a long report doesn't sign you out
+['pointerdown', 'keydown', 'wheel'].forEach(t => document.addEventListener(t, () => {
+  if (viewName() !== 'scan' && Date.now() - mgrLast > 5000) mgrTouch();
+}, { capture: true, passive: true }));
 setInterval(() => {
   const u = cloud.user;
-  if (u && !u.isAnonymous && S.store && Date.now() - mgrLast > MGR_IDLE_MS) { signOutMgr(); if (viewName() !== 'scan') location.hash = ''; }
+  if (u && !u.isAnonymous && S.store && mgrIdleMs() > MGR_IDLE_MS) { signOutMgr(); if (viewName() !== 'scan') location.hash = ''; }
   else wipeManagerCache(); // retry a wipe that had to wait
 }, 30000);
 
