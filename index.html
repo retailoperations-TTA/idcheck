@@ -221,6 +221,11 @@ dialog::backdrop{background:rgba(9,15,30,.62)}
 .hbar .fill{height:10px;background:var(--s1);border-radius:0 4px 4px 0;min-width:2px}
 .hbar .v{text-align:right;font-variant-numeric:tabular-nums}
 .hbar .v small{color:var(--muted);margin-left:4px}
+.hbar .lbl small{color:var(--muted);margin-left:5px}
+.hbar-more{width:100%;font:inherit;color:inherit;text-align:left;background:none;border:0;cursor:pointer}
+.hbar-more .lbl{text-decoration:underline;text-underline-offset:2px}
+.hbar-more .lbl small{display:inline-block;text-decoration:none}
+.hbar-more:hover .fill,.hbar-more:focus-visible .fill{background:var(--s2)}
 details.numbers{margin-top:8px}
 .r-fold>summary{list-style:none;cursor:pointer;display:flex;align-items:center;justify-content:space-between;gap:16px}
 .r-fold>summary::-webkit-details-marker{display:none}
@@ -2175,6 +2180,7 @@ $$('#viewReports .seg button').forEach(b => b.addEventListener('click', () => {
 }));
 $('#rStore').addEventListener('change', e => { R.store = e.target.value; drawReports(); });
 $('#denMore').addEventListener('click', () => { R.allDenials = !R.allDenials; drawReports(); });
+$('#cIssuers').addEventListener('click', e => { if (e.target.closest('[data-iss-more]')) { R.allIssuers = !R.allIssuers; drawReports(); } });
 // Denials start folded up; each computer remembers whether a manager left them open.
 $('#pDen').open = !!ls.get('denOpen', false);
 $('#pDen').addEventListener('toggle', () => ls.set('denOpen', $('#pDen').open));
@@ -2269,12 +2275,20 @@ function drawReports() {
   $('#pWeek').hidden = days.length < 7;
   if (days.length >= 7) weekHeat(docs, days);
 
-  // issuers
-  const iss = sumMap(docs, 'issuer'); const list = Object.keys(iss).map(k => ({ k, n: iss[k] })).sort((a, b) => b.n - a.n);
-  const top = list.slice(0, 8), rest = list.slice(8).reduce((a, x) => a + x.n, 0);
-  if (rest) top.push({ k: 'Other', n: rest });
-  const imax = Math.max(1, ...top.map(x => x.n)), isum = list.reduce((a, x) => a + x.n, 0);
-  $('#cIssuers').innerHTML = top.length ? top.map(x => `<div class="hbar"><span class="lbl" title="${esc(issuerLabel(x.k))}">${esc(issuerLabel(x.k))}</span><div><div class="fill" style="width:${(x.n / imax * 100).toFixed(1)}%"></div></div><span class="v">${x.n.toLocaleString()}<small>${pct(x.n, isum)}</small></span></div>`).join('') : '<p class="empty">No scans in this range yet.</p>';
+  // issuers. Everything past the top 8 sits in one Other row that opens to the full list.
+  const iss = sumMap(docs, 'issuer');
+  const list = Object.keys(iss).map(k => ({ k, n: iss[k] })).sort((a, b) => b.n - a.n || issuerLabel(a.k).localeCompare(issuerLabel(b.k)));
+  const tail = list.slice(8), rest = tail.reduce((a, x) => a + x.n, 0);
+  const openIss = !rest || R.allIssuers;
+  const imax = Math.max(1, ...list.map(x => x.n)), isum = list.reduce((a, x) => a + x.n, 0);
+  const ibar = (label, n, note, more) => `<${more ? 'button type="button" data-iss-more="1" aria-expanded="false" class="hbar hbar-more"' : 'div class="hbar"'}><span class="lbl" title="${esc(label)}">${esc(label)}${note ? `<small>${esc(note)}</small>` : ''}</span><div><div class="fill" style="width:${(n / imax * 100).toFixed(1)}%"></div></div><span class="v">${n.toLocaleString()}<small>${pct(n, isum)}</small></span></${more ? 'button' : 'div'}>`;
+  $('#cIssuers').innerHTML = list.length
+    ? (openIss ? list : list.slice(0, 8)).map(x => ibar(issuerLabel(x.k), x.n)).join('')
+      + (rest ? openIss
+        ? '<button type="button" data-iss-more="1" class="btn-plain" style="margin-top:8px">Show fewer</button>'
+        : ibar('Other', rest, tail.length + ' more', true) : '')
+    : '<p class="empty">No scans in this range yet.</p>';
+
 
   // ages
   const ab = sumMap(docs, 'ageBand'), bands = [['u21', 'Under 21'], ['21-24', '21–24'], ['25-34', '25–34'], ['35-44', '35–44'], ['45-54', '45–54'], ['55-64', '55–64'], ['65+', '65+']];
