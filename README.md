@@ -59,4 +59,4 @@ To see where the time goes on a station, turn on **Show the raw scan next to res
 
 Reports can show the last 90 days or all time. SoHo's history from Aug 2025 to Nov 8, 2026 was imported from the old IDVisor scanner as daily totals only (no names or ID numbers). That export skips some days.
 
-The map panel shows where customers live: a circle per home ZIP code in New York City, and every scan shaded by the state on the ID. `geo.json` holds the map shapes only (borough outlines, ZIP code positions from the `zipcodes` package, US states from `us-atlas`). It has no customer data.
+The map panel shows where customers live: a circle per home ZIP code in New York City, and every scan shaded by the state on the ID. `geo.json` holds the map shapes only (borough outlines, ZIP code positions from the `zipcodes` package, US states from `us-atlas`). It has no customer data. The NYC map draws a grayed-out OpenStreetMap street map underneath (tiles load from `tile.openstreetmap.org`, with the required credit in the corner); `geo.json` uses the same Mercator projection, so the circles line up.

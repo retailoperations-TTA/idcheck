@@ -255,6 +255,12 @@ details.numbers table{margin-top:8px}
 .m-zoom button:disabled{opacity:.35;cursor:default}
 .m-zoom button:focus-visible{outline:2px solid var(--s1);outline-offset:1px}
 .map .bo{fill:#E3E8EE;stroke:#B9C3D0;stroke-width:.8}
+.map.tiled svg{background:#EEF0F2}
+.map .tiles{filter:grayscale(1) brightness(1.08) contrast(.85);opacity:.65}
+.map.tiled .bo{fill:none;stroke:#2A3D66;stroke-opacity:.35;stroke-width:1.2}
+.map .tiles image{pointer-events:none}
+.m-attr{position:absolute;right:0;bottom:0;padding:1px 5px;background:rgba(255,255,255,.8);color:var(--muted);font-size:10px;line-height:1.5;border-top-left-radius:4px}
+.m-attr a{color:inherit}
 .map .zb{fill:var(--s1);fill-opacity:.6;stroke:#fff;stroke-width:.8}
 .map .st{stroke:#fff;stroke-width:.7}
 .map .zb:hover,.map .st:hover{stroke:var(--ink);stroke-width:1.6}
@@ -2434,6 +2440,51 @@ function zoomable(el, opt) {
   el._zoomApply = apply;
   apply();
 }
+/* Street map under the NYC circles. geo.json's NYC shapes use a plain Mercator
+   projection fitted to the city (west edge -74.25559 at x 14.6, north edge 40.91553
+   at y 19.5, 1017.135 units per degree of longitude), the same projection map tiles
+   use, so tiles line up after a scale and a shift. Tiles come from OpenStreetMap
+   (fine for light use with credit shown; see operations.osmfoundation.org/policies/tiles),
+   grayed out in CSS so the circles stand out. If they don't load, the gray
+   background and borough outlines still show. */
+const TILE_URL = (z, x, y) => `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+const TILE_ATTR = '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors';
+const NYC_PROJ = { lon0: -74.25559, x0: 14.6, latN: 40.91553, y0: 19.5, k: 1017.135 };
+function mapTiles(svg, W, H, k, sc) {
+  const P = NYC_PROJ, mN = Math.log(Math.tan(Math.PI / 4 + P.latN * Math.PI / 360));
+  const ox = P.x0 + (-180 - P.lon0) * P.k, oy = P.y0 + P.k * 180 / Math.PI * (mN - Math.PI);
+  const layer = (g, z, vx, vy, vw, vh) => {
+    const t = 360 * P.k / Math.pow(2, z), n = Math.pow(2, z), want = new Set();
+    const x0 = Math.max(0, Math.floor((vx - ox) / t)), x1 = Math.min(n - 1, Math.floor((vx + vw - ox) / t));
+    const y0 = Math.max(0, Math.floor((vy - oy) / t)), y1 = Math.min(n - 1, Math.floor((vy + vh - oy) / t));
+    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) {
+      const key = z + '/' + x + '/' + y; want.add(key);
+      if (g.querySelector(`[data-k="${key}"]`)) continue;
+      const im = document.createElementNS('http://www.w3.org/2000/svg', 'image');
+      im.setAttribute('data-k', key); im.setAttribute('href', TILE_URL(z, x, y));
+      // a hair of overlap hides seams between tiles
+      im.setAttribute('x', (ox + x * t).toFixed(3)); im.setAttribute('y', (oy + y * t).toFixed(3));
+      im.setAttribute('width', (t + t / 256).toFixed(3)); im.setAttribute('height', (t + t / 256).toFixed(3));
+      im.setAttribute('preserveAspectRatio', 'none');
+      g.appendChild(im);
+    }
+    g.querySelectorAll('image').forEach(im => { if (!want.has(im.dataset.k)) im.remove(); });
+  };
+  let base = svg.querySelector('g.tiles > .base'), det = svg.querySelector('g.tiles > .det');
+  if (!base) {
+    const NS = 'http://www.w3.org/2000/svg', wrap = document.createElementNS(NS, 'g');
+    base = document.createElementNS(NS, 'g'); det = document.createElementNS(NS, 'g');
+    wrap.setAttribute('class', 'tiles'); base.setAttribute('class', 'base'); det.setAttribute('class', 'det');
+    wrap.append(base, det); svg.insertBefore(wrap, svg.firstChild);
+  }
+  // Base layer: the whole map at one zoom level, always there so zooming never shows blanks.
+  const zBase = 11; if (!base.firstChild) layer(base, zBase, 0, 0, W, H);
+  // Detail layer: sharper tiles for what's in view once zoomed in.
+  const vb = svg.viewBox.baseVal, z = Math.min(16, Math.round(Math.log2(360 * P.k * k * (sc || 1) / 256)));
+  if (z <= zBase) { while (det.firstChild) det.firstChild.remove(); return; }
+  if (det.dataset.z !== String(z)) { while (det.firstChild) det.firstChild.remove(); det.dataset.z = z; }
+  layer(det, z, vb.x, vb.y, vb.width, vb.height);
+}
 function drawMap(docs) {
   const g = GEO.data;
   if (!g) {
@@ -2481,10 +2532,11 @@ function drawMap(docs) {
   pts.forEach(p => { s += `<text class="zt" x="${p.x}" y="${p.y}" text-anchor="middle" data-r="${rad(p)}" style="display:none">${p.z}</text>`; });
   Object.entries(g.nyc.labels).forEach(([n, [x, y]]) => { s += `<text class="bl" x="${x}" y="${y}" text-anchor="middle">${esc(n)}</text>`; });
   s += `<text class="bl" x="${g.nyc.nj[0]}" y="${g.nyc.nj[1]}" text-anchor="middle">New Jersey</text></svg>`;
-  $('#mNyc').innerHTML = s; mapTips($('#mNyc'));
+  $('#mNyc').innerHTML = s + `<div class="m-attr">${TILE_ATTR}</div>`; $('#mNyc').classList.add('tiled'); mapTips($('#mNyc'));
   zoomable($('#mNyc'), { w: g.nyc.w, h: g.nyc.h, maxK: 12, onZoom: (svg, k, sc) => {
     // Circles shrink a little as you zoom so crowded areas separate; labels stay the same size on screen.
     const sq = Math.sqrt(k);
+    svg._tileZ = [k, sc]; if (!svg._tileRaf) svg._tileRaf = requestAnimationFrame(() => { svg._tileRaf = 0; mapTiles(svg, g.nyc.w, g.nyc.h, svg._tileZ[0], svg._tileZ[1]); });
     svg.querySelectorAll('circle.zb').forEach(c => c.setAttribute('r', (+c.dataset.r / sq).toFixed(2)));
     svg.querySelectorAll('text.bl').forEach(t => { t.style.fontSize = (17 / k) + 'px'; t.style.strokeWidth = (4 / k) + 'px'; });
     svg.querySelectorAll('text.zt').forEach(t => {
