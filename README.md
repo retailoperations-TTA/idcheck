@@ -34,7 +34,7 @@ Signing out is a full sign-out, since store computers are shared:
 - **Scan counts** (Reports): age, result, reason, issuing state, store, station and time. No names.
 - **Home ZIP counts** (Reports map): how many scans came from each 5-digit ZIP code, per store per day. The ZIP is never saved with a scan or a visit.
 - **Never saved**: birth dates, full ID numbers and street addresses. Visits and bans hold a one-way fingerprint of the ID number and of name plus birth date, so they can be matched later without storing the numbers.
-- Store computers can check whether a scanned ID is banned, but can't list the ban list or read names.
+- Store computers can check whether a scanned ID is banned, but can't list the ban list or read names. Each store computer also keeps one connection open to an empty ban-key record (`idBanKeys/_warm`, which holds nothing) so ban checks answer quickly.
 
 New York's rule 9 NYCRR 123.10(d)(5) limits recording customer personal information without consent, beyond what is typically collected in a sale. Confirm this use with TTA compliance.
 
@@ -44,6 +44,16 @@ New York's rule 9 NYCRR 123.10(d)(5) limits recording customer personal informat
 2. Create a Firestore database and paste `firestore.rules` into its Rules tab.
 3. Paste the web app config into `FIREBASE_CONFIG` near the top of the second script in `index.html`. Keep `MANAGER_EMAILS` the same as the list in the rules.
 4. On each store computer, open the page and pick the store. A link like `?store=usq` picks it automatically.
+
+## If scanning feels slow
+
+A scan has three parts: the scanner typing the barcode (about half a second), a short quiet period that tells the page the barcode is finished, and the ban-list check. The ban check now starts while the barcode is still typing and the Firebase connection is kept open between scans, so the result should land within a fraction of a second of the last character.
+
+To see where the time goes on a station, turn on **Show the raw scan next to results** under Settings, Scanner setup. A line above the raw scan then reports how long the scanner typed, how long the page waited after the last character, how long the ban check took, and how long after the last character the result was on screen. If the "quiet" number is about 1.5 seconds on every scan, the scanner is sending the barcode shorter than its header says, so send that raw scan along for a fix. Other things that slow a station down:
+
+- A second ID Check tab in the same browser. Firebase lets only one tab talk to the server, and the other waits on it. Keep one tab open.
+- An inter-character delay set on the scanner. Zebra and Honeywell scanners have a setup barcode that sets it to 0.
+- The page not being the focused window. The status pill turns red and says "Click the page to scan" when that happens.
 
 ## Reports history and map
 

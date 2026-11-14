@@ -106,6 +106,7 @@ button{cursor:pointer}
 .raw h3{font-size:14px;font-weight:600;color:var(--on-cover-muted);margin:0 0 6px}
 .raw pre{margin:0;white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.5;background:var(--cover);padding:10px;border-radius:6px;max-height:260px;overflow:auto}
 .raw .cc{color:#F5B971}
+.raw-time{margin:0 0 8px;font-size:13px;color:var(--on-cover-muted);font-variant-numeric:tabular-nums}
 
 .foot{display:flex;align-items:center;gap:14px 24px;padding:12px 24px 20px;flex-wrap:wrap}
 .tally{display:flex;gap:22px;margin:0;align-items:baseline;flex-wrap:wrap}
@@ -363,6 +364,7 @@ details.numbers table{margin-top:8px}
     </div>
     <div class="raw" id="rawBox" hidden>
       <h3>Raw scan (not saved)</h3>
+      <p class="raw-time" id="rawTime"></p>
       <pre id="rawText"></pre>
     </div>
   </aside>
@@ -1034,7 +1036,7 @@ const BAN_REASONS = [
   ['other', 'Other']
 ];
 
-const APP_VERSION = '1.7.2';
+const APP_VERSION = '1.8.0';
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const DEDUPE_MS = 120000; // same card again within 2 minutes is counted once
 const BAN_WAIT_MS = 1500; // how long a scan waits on the ban list before showing
@@ -1127,12 +1129,13 @@ function tones(freqs, dur, type, vol) {
 const SOUND = { clear: () => tones([784, 1175], .13, 'sine', .28), deny: () => tones([196, 196, 196], .2, 'square', .12), check: () => tones([523, 523], .15, 'triangle', .3) };
 
 /* ---------------- status + focus ---------------- */
-const Scan = { active: false, buf: '', timer: 0, alt: '', t0: 0, last: 0, n: 0 };
+const Scan = { active: false, checking: false, buf: '', timer: 0, alt: '', t0: 0, last: 0, n: 0 };
 function refreshStatus() {
   const st = $('#status'), focused = document.hasFocus();
   $('#focusbar').hidden = focused;
   if (!focused) { st.dataset.s = 'blur'; $('#statusText').textContent = 'Click the page to scan'; }
   else if (Scan.active) { st.dataset.s = 'reading'; $('#statusText').textContent = 'Reading barcode'; }
+  else if (Scan.checking) { st.dataset.s = 'reading'; $('#statusText').textContent = 'Checking the ID'; }
   else { st.dataset.s = 'ready'; $('#statusText').textContent = 'Ready to scan'; }
   $('#nostore').hidden = !!S.store;
   $('#brandStore').textContent = S.store ? storeName(S.store) + (S.station ? ', ' + S.station : '') : '';
@@ -1170,7 +1173,12 @@ function scanProgress(buf) {
     if (!m) return t.length < pos + n * 10 ? { pending: true } : null;
     end = Math.max(end, +m[1] + +m[2]);
   }
-  return { done: t.length >= end - 3, have: t.length, need: end };
+  // Some scanners don't type the record separator or the carriage returns,
+  // so the text can come in a little shorter than the header counts: up to
+  // 2 characters from the header and 1 for each subfile's terminator. Without
+  // this slack a complete scan looked unfinished and sat out the long timer.
+  const slack = Math.max(3, 2 + n);
+  return { done: t.length >= end - slack, have: t.length, need: end };
 }
 function inField(el) {
   if (!el) return false;
@@ -1185,6 +1193,27 @@ function arm() {
   // Passport text has no header, but its check digits say when all of it is in.
   const p = scanProgress(Scan.buf) || C.mrzProgress(Scan.buf);
   Scan.timer = setTimeout(finishScan, !p ? IDLE_MS : p.done ? DONE_MS : PARTIAL_MS);
+  if (Scan.buf.endsWith('\n')) prefetchBan(); // a line just finished: maybe enough to start the ban check
+}
+/* Start the ban check while the barcode is still being typed. The ID number,
+   name and birth date arrive well before the end of the barcode, so the
+   answer is usually back before the last character is. Only complete lines
+   are read, and the keys are compared with the finished scan before the
+   early answer is used. */
+const Pre = { at: 0, p: null };
+function prefetchBan() {
+  if (!FIREBASE_CONFIG || Pre.p || !cloud.user) return;
+  const buf = Scan.buf, nl = buf.lastIndexOf('\n');
+  if (nl <= Pre.at || nl < 60) return;
+  Pre.at = nl;
+  const head = buf.slice(0, nl);
+  if (head.indexOf('DAQ') < 0 || head.indexOf('DBB') < 0 || (head.indexOf('DCS') < 0 && head.indexOf('DAA') < 0)) return;
+  let r;
+  try { r = C.analyze(head); } catch (e) { return; }
+  if (!r.recognized || r.fallback || r.mrz || !r.dob || !(r.fields && r.fields.DAQ) || !(r.name && r.name.last)) return;
+  Pre.p = personKeys(r)
+    .then(keys => ({ keys, p: keys.person || keys.alt ? lookupBan(keys).catch(err => { console.warn(err); return { state: 'error' }; }) : null }))
+    .catch(() => null);
 }
 document.addEventListener('keydown', e => {
   if (e.isComposing) return;
@@ -1198,7 +1227,7 @@ document.addEventListener('keydown', e => {
       }
       if (inField(document.activeElement) && k !== '@') return;
     }
-    Scan.active = true; Scan.buf = ''; Scan.alt = ''; Scan.t0 = performance.now(); Scan.n = 0; refreshStatus();
+    Scan.active = true; Scan.buf = ''; Scan.alt = ''; Scan.t0 = performance.now(); Scan.n = 0; Pre.at = 0; Pre.p = null; refreshStatus();
   }
   Scan.last = performance.now(); Scan.n++;
   e.preventDefault(); e.stopPropagation();
@@ -1222,17 +1251,28 @@ document.addEventListener('keyup', e => {
     arm();
   }
 }, true);
+/* How long the last scan took, shown next to the raw scan when "Show the
+   raw scan" is on (Settings), so a slow station can be diagnosed. */
+const T = { seq: 0, typed: 0, quiet: 0, ban: 0, pre: false, last: 0 };
+function timingText() {
+  const s = x => (Math.max(0, x) / 1000).toFixed(2) + 's';
+  return 'Scanner typed for ' + s(T.typed) + ', quiet ' + s(T.quiet) + ' before the scan was called done' +
+    (T.ban ? ', ban list ' + s(T.ban) + (T.pre ? ' (started during the scan)' : '') : '') +
+    '. On screen ' + s(performance.now() - T.last) + ' after the last key.';
+}
 function finishScan() {
   const raw = Scan.buf, n = Scan.n, gap = n > 1 ? (Scan.last - Scan.t0) / (n - 1) : Infinity;
-  Scan.active = false; Scan.buf = ''; Scan.alt = ''; refreshStatus();
+  Scan.active = false; Scan.buf = ''; Scan.alt = '';
   // Short input: a stray keypress, unless it came in at scanner speed. A
   // small barcode (an inventory or license number barcode) is short, and
   // dropping it silently looked like the scanner did nothing.
   const scannerSpeed = n >= 4 && gap < 60;
-  if (raw.replace(/\s/g, '').length < 16 && !scannerSpeed) return;
+  if (raw.replace(/\s/g, '').length < 16 && !scannerSpeed) { Pre.p = null; refreshStatus(); return; }
   $$('dialog').forEach(d => d.open && d.close());
+  T.typed = Scan.last - Scan.t0; T.quiet = performance.now() - Scan.last; T.last = Scan.last; T.ban = 0; T.pre = false; T.seq = 0;
+  Scan.checking = true; refreshStatus();
   scansBusy++;
-  handleRaw(raw, 'scan').catch(scanFailed).finally(() => { scansBusy--; });
+  handleRaw(raw, 'scan').catch(scanFailed).finally(() => { scansBusy--; Scan.checking = false; refreshStatus(); });
 }
 let scansBusy = 0; // scans still being checked (the cache wipe waits for these)
 /* A scan must never end in a blank screen. If anything breaks while
@@ -1284,6 +1324,9 @@ function banVerdict(v, b) {
 async function handleRaw(raw, source) {
   if (viewName() !== 'scan') location.hash = '';
   const seq = ++scanSeq;
+  const pre = source === 'scan' ? Pre.p : null; // a ban check started while the barcode was typing
+  Pre.p = null; Pre.at = 0;
+  if (source === 'scan') T.seq = seq;
   const r = C.analyze(raw);
   // Passport text that didn't pass its check digits is almost always a
   // misread (glare, a bent page). Ask for a rescan instead of counting it.
@@ -1305,8 +1348,15 @@ async function handleRaw(raw, source) {
   let keys = { person: null, alt: null }, ban = { state: 'skip' }, late = null;
   try { keys = await personKeys(r); } catch (e) { console.warn('ID Check keys failed', e); }
   if (FIREBASE_CONFIG && (keys.person || keys.alt)) {
-    const p = lookupBan(keys).catch(err => { console.warn(err); return { state: 'error' }; });
+    let p = null;
+    if (pre) { // use the early check only if it looked up exactly these keys
+      const x = await pre;
+      if (x && x.p && x.keys.person === keys.person && x.keys.alt === keys.alt) { p = x.p; T.pre = true; }
+    }
+    if (!p) p = lookupBan(keys).catch(err => { console.warn(err); return { state: 'error' }; });
+    const tb = performance.now();
     ban = await waitFor(p, BAN_WAIT_MS);
+    if (source === 'scan') T.ban = Math.max(1, performance.now() - tb); // never 0, so the timing line shows it was checked
     if (ban.state === 'slow') late = p;
   }
   if (ban.state === 'hit') v = banVerdict(v, ban.ban);
@@ -1360,6 +1410,7 @@ function showResult(r, v, note, raw, seq) {
   // raw (troubleshooting only, never saved)
   if (S.showRaw && raw) {
     $('#rawBox').hidden = false;
+    $('#rawTime').textContent = T.seq && T.seq === seq ? timingText() : '';
     $('#rawText').innerHTML = esc(raw).replace(/\n/g, '<span class="cc">⏎</span>\n').replace(/\r/g, '<span class="cc">␍</span>\n').replace(/\x1e/g, '<span class="cc">␞</span>').replace(/\x1d/g, '<span class="cc">␝</span>');
   } else $('#rawBox').hidden = true;
 
@@ -1379,7 +1430,7 @@ function clearResult() {
   const page = $('#page'); page.dataset.state = 'idle'; page.classList.remove('stamped');
   $('#idle').hidden = false; $('#result').hidden = true;
   $('#detIdle').hidden = false; $('#detFull').hidden = true; $('#facts').innerHTML = ''; $('#dName').textContent = '';
-  $('#rawBox').hidden = true; $('#rawText').textContent = '';
+  $('#rawBox').hidden = true; $('#rawText').textContent = ''; $('#rawTime').textContent = '';
   $('#drain').style.animation = 'none';
 }
 $('#clearNow').addEventListener('click', clearResult);
@@ -1581,7 +1632,27 @@ function liveDb() {
   cloud.db = makeDb(cloud.app);
   for (const [id, d] of sending) if (d === db) sending.delete(id); // scans sent on it get sent again
   console.warn('ID Check: the Firebase connection was shut down by another ID Check tab. Reconnected.');
+  keepWarm();
   return cloud.db;
+}
+/* Firebase drops its connection after about a minute with nothing to do, and
+   the next ban check then pays to open a new one: often most of a second on
+   store Wi-Fi, and the screen waits on it. One listener left open on an empty
+   ban-key document (no data in it, nothing to read) holds the connection
+   open, so a ban check is a single quick round trip. */
+const warm = { db: null, off: null };
+function keepWarm() {
+  const db = cloud.user && cloud.db && !wiping ? cloud.db : null;
+  if (warm.db === db) return;
+  if (warm.off) { try { warm.off(); } catch (e) {} warm.off = null; }
+  warm.db = db;
+  if (!db) return;
+  try {
+    warm.off = cloud.fs.onSnapshot(cloud.fs.doc(db, 'idBanKeys', '_warm'), () => {}, err => {
+      console.warn('ID Check: keep-warm listener stopped', err);
+      if (warm.db === db) { warm.db = null; warm.off = null; } // the 30-second check opens it again
+    });
+  } catch (e) { warm.db = null; }
 }
 function renderCloud() {
   const el = $('#cloud'); let txt = '', s = 'off';
@@ -1617,6 +1688,7 @@ async function wipeManagerCache() {
     const synced = await Promise.race([fs.waitForPendingWrites(db).then(() => true), new Promise(res => setTimeout(() => res(false), 8000))]);
     if (!synced || pending.length || cloud.inflight || scansBusy || Scan.active || !cloud.user || !cloud.user.isAnonymous) return;
     cloud.db = null; // new scans wait in the queue for the few moments this takes
+    keepWarm(); // let go of the listener on the connection being closed
     await fs.terminate(db);
     try { await fs.clearIndexedDbPersistence(db); ls.set('wipeCache', false); }
     catch (e) { wipeBlocked = true; console.warn('ID Check: saved manager data will be wiped once other ID Check tabs are closed', e); }
@@ -1624,7 +1696,7 @@ async function wipeManagerCache() {
   } catch (e) {
     console.warn('ID Check cache wipe failed', e);
     if (!cloud.db) cloud.db = makeDb(cloud.app);
-  } finally { wiping = false; flush(); }
+  } finally { wiping = false; flush(); keepWarm(); }
 }
 async function initCloud() {
   if (!FIREBASE_CONFIG) { renderCloud(); renderManagerView(); return; }
@@ -1638,6 +1710,7 @@ async function initCloud() {
       cloud.user = user;
       if (!user) au.signInAnonymously(cloud.auth).catch(err => { cloud.state = 'error'; cloud.err = err.code || 'sign-in failed'; renderCloud(); });
       else { cloud.state = 'on'; flush(); wipeManagerCache(); }
+      keepWarm();
       renderCloud(); renderManagerView();
     });
   } catch (err) {
@@ -1848,6 +1921,7 @@ setInterval(() => {
   if (u && !u.isAnonymous && S.store && mgrIdleMs() > MGR_IDLE_MS) { signOutMgr(); if (viewName() !== 'scan') location.hash = ''; }
   else wipeManagerCache(); // retry a wipe that had to wait
   if (pending.length) flush(); // retry scans that haven't saved yet
+  keepWarm(); // reopen the keep-warm listener if it was dropped
 }, 30000);
 
 function toast(msg) {
@@ -2527,7 +2601,7 @@ window.addEventListener('resize', () => { clearTimeout(rz); rz = setTimeout(() =
 /* ---------------- start ---------------- */
 renderTally(); refreshStatus(); route(); renderCloud(); initCloud();
 if (!S.store) setTimeout(() => openDialog('setup'), 300);
-window.IDCheckDebug = { handleRaw, drawReports, R, S, clearRecent: () => recent.clear() }; // used for testing
+window.IDCheckDebug = { handleRaw, drawReports, R, S, T, clearRecent: () => recent.clear() }; // used for testing
 })();
 </script>
 </body>
