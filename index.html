@@ -44,8 +44,11 @@ button{cursor:pointer}
 .dot{width:10px;height:10px;border-radius:50%;background:#43D18E}
 .status[data-s="ready"] .dot{animation:pulse 2.6s ease-out infinite}
 .status[data-s="reading"] .dot{background:var(--focus)}
-.status[data-s="blur"]{background:var(--deny);color:#fff}
-.status[data-s="blur"] .dot{background:#fff}
+.status[data-s="blur"],.status[data-s="fail"]{background:var(--deny);color:#fff}
+.status[data-s="blur"] .dot,.status[data-s="fail"] .dot{background:#fff}
+.status[data-s="quiet"]{background:var(--check-tint);color:var(--ink)}
+.status[data-s="quiet"] .dot{background:var(--check)}
+.diag{margin:6px 0 8px;padding:10px 12px;border-radius:8px;background:rgba(0,0,0,.06);font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;max-height:220px;overflow:auto}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(67,209,142,.55)}70%{box-shadow:0 0 0 9px rgba(67,209,142,0)}100%{box-shadow:0 0 0 0 rgba(67,209,142,0)}}
 .focusbar{margin:0 24px 14px;padding:12px 16px;border-radius:8px;background:var(--deny);color:#fff;font-weight:600}
 .warnbar{margin:0 24px 14px;padding:12px 16px;border-radius:8px;background:var(--check-tint);color:var(--ink);font-weight:500}
@@ -339,6 +342,7 @@ details.numbers table{margin-top:8px}
 
 <div id="banners">
   <p class="focusbar" id="focusbar" hidden>The scanner can't type into this page right now. Click anywhere on this page to turn it back on.</p>
+  <p class="focusbar" id="scanwarn" hidden></p>
   <p class="warnbar" id="nostore" hidden>This computer isn't assigned to a store yet, so scans aren't being saved.<button class="btn-ink small" data-open="setup">Pick a store</button></p>
 </div>
 
@@ -595,6 +599,13 @@ details.numbers table{margin-top:8px}
       <div class="samples" id="samples"></div>
       <label>Or paste scan text to test it <textarea id="pasteBox" rows="3"></textarea></label>
       <button class="btn-plain" id="pasteGo">Check pasted text</button>
+    </section>
+    <section>
+      <h3>Scan problems</h3>
+      <p class="hint">Every scan that didn't read on this computer in the last 14 days: when, how long it was and what was wrong with it. Nothing from the ID itself is kept.</p>
+      <p class="hint" id="diagKb"></p>
+      <div class="diag" id="diagList"></div>
+      <button class="btn-plain" id="diagCopy">Copy this list</button>
     </section>
     <section>
       <h3>On-screen count</h3>
@@ -1047,7 +1058,7 @@ const BAN_REASONS = [
   ['other', 'Other']
 ];
 
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const DEDUPE_MS = 120000; // same card again within 2 minutes is counted once
 const BAN_WAIT_MS = 1500; // how long a scan waits on the ban list before showing
@@ -1140,13 +1151,77 @@ function tones(freqs, dur, type, vol) {
 const SOUND = { clear: () => tones([784, 1175], .13, 'sine', .28), deny: () => tones([196, 196, 196], .2, 'square', .12), check: () => tones([523, 523], .15, 'triangle', .3) };
 
 /* ---------------- status + focus ---------------- */
-const Scan = { active: false, checking: false, buf: '', timer: 0, alt: '', t0: 0, last: 0, n: 0 };
+const Scan = { active: false, checking: false, buf: '', timer: 0, alt: '', t0: 0, last: 0, n: 0, remap: 0 };
+
+/* ---------------- scanner health ----------------
+   Every scan that didn't read is written down (time, size and shape, never
+   the text itself), and the status pill stops saying "Ready to scan" when
+   scans keep failing or a busy scanner goes quiet. */
+const FAIL_RUN = 3;             // this many failed scans in a row: warn
+const HARD_RUN = 2;             // or this many cut-off / garbled scans in a row
+const QUIET_MS = 30 * 60000;    // a busy scanner silent this long: warn
+const QUIET_MAX_MS = 3 * 3600000; // after this, assume the store is closed
+const QUIET_BUSY = 5;           // "busy" = this many scans in the hour before the silence
+const DIAG_KEEP = 300, DIAG_DAYS = 14;
+const Health = { fails: 0, hard: 0, times: [] };
+const DIAG_LABEL = { wrong_barcode: 'Wrong barcode', cut_off: 'Scan cut off', restart: 'Scan cut off, next scan started', garbled: 'Scan garbled',
+  mrz_misread: 'Passport misread', mrz_visa: 'Visa scanned', unreadable: 'No ID data found', error: 'App error' };
+// What a scan looked like, without keeping any of it.
+function scanShape(raw) {
+  const t = String(raw || ''), p = scanProgress(t);
+  const o = { len: t.length, lines: (t.match(/\n/g) || []).length, sym: t.replace(/^\s+/, '')[0] === '@', hdr: /(?:ANSI|AAMVA) ?\d{6}/.test(t),
+    odd: (t.match(/[^\x20-\x7e\n\x1c-\x1e]/g) || []).length, codes: (t.match(/D[A-D][A-Z]/g) || []).length };
+  if (p && p.need) { o.have = p.have; o.need = p.need; }
+  return o;
+}
+function scanTick() { const now = Date.now(); Health.times.push(now); Health.times = Health.times.filter(t => now - t < QUIET_MAX_MS + 3600000); }
+function scanGood(meta) {
+  Health.fails = 0; Health.hard = 0; scanTick();
+  if (meta && meta.remap) { const k = ls.get('kbFix', {}), d = dayKey(new Date()); ls.set('kbFix', { day: d, n: (k.day === d ? k.n : 0) + 1 }); }
+  refreshStatus();
+}
+function scanBad(kind, raw, meta) {
+  Health.fails++; Health.hard = kind === 'cut_off' || kind === 'restart' || kind === 'garbled' || kind === 'error' ? Health.hard + 1 : 0; scanTick();
+  try {
+    const now = Date.now(), m = meta || {};
+    const log = ls.get('diag', []).filter(x => now - x.at < DIAG_DAYS * 86400000);
+    log.push(Object.assign({ at: now, kind, keys: m.n || 0, ms: Math.round(m.typed || 0), remap: m.remap || 0, v: APP_VERSION }, scanShape(raw)));
+    ls.set('diag', log.slice(-DIAG_KEEP));
+  } catch (e) { console.warn('ID Check scan log failed', e); }
+  refreshStatus();
+}
+function diagLine(x) {
+  const d = new Date(x.at);
+  const bits = [x.len + ' character' + (x.len === 1 ? '' : 's') + ', ' + x.lines + ' line' + (x.lines === 1 ? '' : 's'),
+    x.hdr ? 'ID header present' : x.sym ? 'started like an ID, header missing' : 'no ID header',
+    x.need ? x.have + ' of ' + x.need + ' characters arrived' : '',
+    x.odd ? x.odd + ' unexpected character' + (x.odd === 1 ? '' : 's') : '',
+    x.remap ? 'keyboard language was not US English (corrected)' : '',
+    x.keys ? 'typed in ' + (x.ms / 1000).toFixed(2) + 's' : ''].filter(Boolean);
+  return (d.getMonth() + 1) + '/' + d.getDate() + ' ' + hhmm(d) + '  ' + (DIAG_LABEL[x.kind] || x.kind) + ': ' + bits.join(', ');
+}
+function diagText() { return ls.get('diag', []).slice().reverse().map(diagLine).join('\n'); }
+function scanTrouble() {
+  if (Health.fails >= FAIL_RUN || Health.hard >= HARD_RUN) return 'fail';
+  const ts = Health.times, last = ts[ts.length - 1], ago = Date.now() - last;
+  if (last && ago > QUIET_MS && ago < QUIET_MAX_MS && ts.filter(t => last - t < 3600000).length >= QUIET_BUSY) return 'quiet';
+  return '';
+}
 function refreshStatus() {
-  const st = $('#status'), focused = document.hasFocus();
+  const st = $('#status'), focused = document.hasFocus(), trouble = scanTrouble(), sw = $('#scanwarn');
   $('#focusbar').hidden = focused;
+  sw.hidden = !trouble || !focused;
+  if (trouble) {
+    sw.className = trouble === 'fail' ? 'focusbar' : 'warnbar';
+    sw.textContent = trouble === 'fail'
+      ? 'The last ' + Math.max(Health.fails, Health.hard) + ' scans didn’t read. Unplug the scanner cable and plug it back in, at the scanner handle and at the computer, then scan again. Until it works, use Manual check and tell a manager.'
+      : 'No scans in the last 30 minutes. If nothing happens when you scan, unplug the scanner cable and plug it back in, at the scanner handle and at the computer.';
+  }
   if (!focused) { st.dataset.s = 'blur'; $('#statusText').textContent = 'Click the page to scan'; }
   else if (Scan.active) { st.dataset.s = 'reading'; $('#statusText').textContent = 'Reading barcode'; }
   else if (Scan.checking) { st.dataset.s = 'reading'; $('#statusText').textContent = 'Checking the ID'; }
+  else if (trouble === 'fail') { st.dataset.s = 'fail'; $('#statusText').textContent = 'Scans are failing'; }
+  else if (trouble === 'quiet') { st.dataset.s = 'quiet'; $('#statusText').textContent = 'No scans lately'; }
   else { st.dataset.s = 'ready'; $('#statusText').textContent = 'Ready to scan'; }
   $('#nostore').hidden = !!S.store;
   $('#brandStore').textContent = S.store ? storeName(S.store) + (S.station ? ', ' + S.station : '') : '';
@@ -1226,9 +1301,35 @@ function prefetchBan() {
     .then(keys => ({ keys, p: keys.person || keys.alt ? lookupBan(keys).catch(err => { console.warn(err); return { state: 'error' }; }) : null }))
     .catch(() => null);
 }
+/* The scanner presses physical keys as if the keyboard were US English. If
+   Windows' input language flips (Win+Space, Alt+Shift), the characters the
+   browser reports for those keys change and every scan turns to gibberish.
+   So read which key was pressed and work out the US character ourselves. */
+const US_KEYS = { Backquote: '`~', Digit1: '1!', Digit2: '2@', Digit3: '3#', Digit4: '4$', Digit5: '5%', Digit6: '6^', Digit7: '7&', Digit8: '8*', Digit9: '9(', Digit0: '0)',
+  Minus: '-_', Equal: '=+', BracketLeft: '[{', BracketRight: ']}', Backslash: '\\|', IntlBackslash: '\\|', Semicolon: ';:', Quote: '\'"', Comma: ',<', Period: '.>', Slash: '/?', Space: '  ',
+  NumpadAdd: '++', NumpadSubtract: '--', NumpadMultiply: '**', NumpadDivide: '//' };
+function usChar(e) {
+  const c = e.code || '';
+  if (/^Key[A-Z]$/.test(c)) { const up = e.shiftKey !== !!(e.getModifierState && e.getModifierState('CapsLock')); return up ? c[3] : c[3].toLowerCase(); }
+  if (US_KEYS[c]) return US_KEYS[c][e.shiftKey ? 1 : 0];
+  if (/^Numpad\d$/.test(c) && /^\d$/.test(e.key)) return e.key;
+  return '';
+}
+const RESTART_MS = 100; // an "@" this long after the last key is a new scan, not more of the old one
+const BUF_MAX = 8000;   // no ID barcode is this long: a stuck key or a scanner sending junk
+function newScan() { Scan.active = true; Scan.buf = ''; Scan.alt = ''; Scan.t0 = performance.now(); Scan.n = 0; Scan.remap = 0; Pre.at = 0; Pre.p = null; }
 document.addEventListener('keydown', e => {
-  if (e.isComposing) return;
-  const k = e.key, altDigit = e.altKey && /^Numpad\d$/.test(e.code);
+  const us = usChar(e);
+  if (e.isComposing && !us) return;
+  const k = us || e.key, altDigit = e.altKey && /^Numpad\d$/.test(e.code);
+  const plain = !e.ctrlKey && !e.metaKey && !e.altKey;
+  if (Scan.active && plain && k === '@' && Scan.buf.indexOf('@') >= 0 && performance.now() - Scan.last > RESTART_MS) {
+    // The last scan was cut off and the ID is being scanned again. Drop the
+    // partial one so it can't run into this one.
+    clearTimeout(Scan.timer);
+    scanBad('restart', Scan.buf, { n: Scan.n, typed: Scan.last - Scan.t0, remap: Scan.remap });
+    newScan();
+  }
   if (!Scan.active) {
     if (!altDigit) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -1238,9 +1339,10 @@ document.addEventListener('keydown', e => {
       }
       if (inField(document.activeElement) && k !== '@') return;
     }
-    Scan.active = true; Scan.buf = ''; Scan.alt = ''; Scan.t0 = performance.now(); Scan.n = 0; Pre.at = 0; Pre.p = null; refreshStatus();
+    newScan(); refreshStatus();
   }
   Scan.last = performance.now(); Scan.n++;
+  if (us && plain && us !== e.key) Scan.remap++;
   e.preventDefault(); e.stopPropagation();
   if (altDigit) Scan.alt += e.code.slice(6);
   else if (e.ctrlKey && !e.altKey) {
@@ -1250,6 +1352,7 @@ document.addEventListener('keydown', e => {
   }
   else if (k === 'Enter' || k === 'Tab') Scan.buf += '\n';
   else if (k.length === 1 && !e.altKey) Scan.buf += k;
+  if (Scan.buf.length > BUF_MAX) { clearTimeout(Scan.timer); finishScan(); return; }
   arm();
 }, true);
 document.addEventListener('keyup', e => {
@@ -1273,7 +1376,9 @@ function timingText() {
 }
 function finishScan() {
   const raw = Scan.buf, n = Scan.n, gap = n > 1 ? (Scan.last - Scan.t0) / (n - 1) : Infinity;
-  Scan.active = false; Scan.buf = ''; Scan.alt = '';
+  const meta = { n, typed: Scan.last - Scan.t0, remap: Scan.remap };
+  clearTimeout(Scan.timer);
+  Scan.active = false; Scan.buf = ''; Scan.alt = ''; Scan.remap = 0;
   // Short input: a stray keypress, unless it came in at scanner speed. A
   // small barcode (an inventory or license number barcode) is short, and
   // dropping it silently looked like the scanner did nothing.
@@ -1283,7 +1388,7 @@ function finishScan() {
   T.typed = Scan.last - Scan.t0; T.quiet = performance.now() - Scan.last; T.last = Scan.last; T.ban = 0; T.pre = false; T.seq = 0;
   Scan.checking = true; refreshStatus();
   scansBusy++;
-  handleRaw(raw, 'scan').catch(scanFailed).finally(() => { scansBusy--; Scan.checking = false; refreshStatus(); });
+  handleRaw(raw, 'scan', meta).catch(err => { scanBad('error', raw, meta); scanFailed(err); }).finally(() => { scansBusy--; Scan.checking = false; refreshStatus(); });
 }
 let scansBusy = 0; // scans still being checked (the cache wipe waits for these)
 /* A scan must never end in a blank screen. If anything breaks while
@@ -1332,16 +1437,35 @@ function banVerdict(v, b) {
     head: 'Banned from all TTA stores', why: [BAN_LABEL[b.reason] ? 'Reason: ' + BAN_LABEL[b.reason] + '.' : '', when, 'Get a manager.'].filter(Boolean).join(' ')
   });
 }
-async function handleRaw(raw, source) {
+async function handleRaw(raw, source, meta) {
   if (viewName() !== 'scan') location.hash = '';
   const seq = ++scanSeq;
-  const pre = source === 'scan' ? Pre.p : null; // a ban check started while the barcode was typing
+  const scanned = source === 'scan';
+  const pre = scanned ? Pre.p : null; // a ban check started while the barcode was typing
   Pre.p = null; Pre.at = 0;
-  if (source === 'scan') T.seq = seq;
+  if (scanned) T.seq = seq;
   const r = C.analyze(raw);
+  const bad = kind => { if (scanned) scanBad(kind, raw, meta); };
+  // An ID barcode that stopped partway (a loose cable, the scanner dropping
+  // out) or came through scrambled: ask for a rescan instead of judging the
+  // ID on half its data. Only when the birth date didn't make it, so a card
+  // whose header miscounts its own length still reads.
+  if (scanned && !r.mrz && (!r.recognized || !r.dob)) {
+    const p = scanProgress(raw), shape = scanShape(raw);
+    const cut = !!p && ((p.pending && shape.sym) || (p.need && !p.done));
+    const garbled = !cut && !r.recognized && shape.len >= 150 && (shape.sym || shape.hdr || shape.odd > 0 || shape.codes >= 3);
+    if (cut || garbled) {
+      bad(cut ? 'cut_off' : 'garbled');
+      showResult(r, { status: 'check', miss: true, reason: cut ? 'cut_off' : 'garbled', main: 'SCAN AGAIN', sub: cut ? 'Scan cut off' : 'Scan garbled', flags: [], age: null,
+        head: cut ? 'Only part of the barcode came through' : 'The barcode came through scrambled',
+        why: 'Scan the ID again and hold it steady until the scanner beeps. If it keeps happening, unplug the scanner cable and plug it back in at both ends, or use Manual check.' }, 'Not counted.', raw, seq);
+      return;
+    }
+  }
   // Passport text that didn't pass its check digits is almost always a
   // misread (glare, a bent page). Ask for a rescan instead of counting it.
   if (r.mrz && !r.recognized) {
+    bad(r.mrzVisa ? 'mrz_visa' : 'mrz_misread');
     showResult(r, { status: 'check', miss: true, reason: r.mrzVisa ? 'mrz_visa' : 'mrz_misread', main: 'SCAN AGAIN', sub: r.mrzVisa ? 'That was a visa' : 'Passport misread', flags: [], age: null,
       head: r.mrzVisa ? 'That was the visa, not the passport' : "Couldn't read the passport cleanly",
       why: r.mrzVisa ? 'Scan the 2 lines of text at the bottom of the passport photo page.' : 'Hold the photo page flat and still, out of direct light, and scan the 2 lines of text again. Still failing? Use Manual check.' },
@@ -1351,11 +1475,13 @@ async function handleRaw(raw, source) {
   // A short barcode that isn't ID data (a store tag, the small barcode on
   // some cards): ask for a rescan instead of counting it as flagged.
   if (!r.recognized && raw.replace(/\s/g, '').length < 150) {
+    bad('wrong_barcode');
     showResult(r, { status: 'check', miss: true, reason: 'wrong_barcode', main: 'TRY AGAIN', sub: 'Wrong barcode', flags: [], age: null,
       head: "That wasn't the ID barcode", why: 'Aim at the wide barcode on the back of the license or state ID, or the 2 lines of text under a passport photo. No barcode, or it won’t scan? Use Manual check.' }, 'Not counted.', raw, seq);
     return;
   }
   let v = C.verdict(r, { minAge: S.minAge, today: new Date() });
+  if (scanned) { if (r.recognized) scanGood(meta); else bad('unreadable'); }
   let keys = { person: null, alt: null }, ban = { state: 'skip' }, late = null;
   try { keys = await personKeys(r); } catch (e) { console.warn('ID Check keys failed', e); }
   if (FIREBASE_CONFIG && (keys.person || keys.alt)) {
@@ -1771,8 +1897,15 @@ $('#suStores').innerHTML = STORES.map(s => `<label><input type="radio" name="suS
 function fillSettings() {
   setStore.value = S.store; $('#setStation').value = S.station; $('#setAge').value = S.minAge;
   $('#setClear').value = String(S.clearSecs); $('#setSound').checked = S.sound; $('#setRaw').checked = S.showRaw;
+  const kb = ls.get('kbFix', {}), kbN = kb.day === dayKey(new Date()) ? kb.n : 0;
+  $('#diagKb').textContent = kbN ? kbN + (kbN === 1 ? ' scan' : ' scans') + ' today came in while this computer’s keyboard language was not US English. ID Check corrected ' + (kbN === 1 ? 'it' : 'them') + ', but set the language back to English (US) so other programs aren’t affected.' : '';
+  $('#diagList').textContent = diagText() || 'No failed scans recorded.';
   renderCloud();
 }
+$('#diagCopy').addEventListener('click', () => {
+  const txt = 'ID Check ' + APP_VERSION + ', ' + (storeName(S.store) || 'no store') + (S.station ? ', ' + S.station : '') + '\n' + (diagText() || 'No failed scans recorded.');
+  navigator.clipboard.writeText(txt).then(() => toast('Copied'), () => toast('Couldn’t copy'));
+});
 function fillSetup() {
   $$('#suStores input').forEach(i => { i.checked = i.value === S.store; });
   $('#suStation').value = S.station; $('#suErr').textContent = '';
