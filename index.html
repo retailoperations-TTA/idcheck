@@ -1058,7 +1058,7 @@ const BAN_REASONS = [
   ['other', 'Other']
 ];
 
-const APP_VERSION = '1.9.0';
+const APP_VERSION = '1.9.1';
 const SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const DEDUPE_MS = 120000; // same card again within 2 minutes is counted once
 const BAN_WAIT_MS = 1500; // how long a scan waits on the ban list before showing
@@ -1803,7 +1803,7 @@ function renderCloud() {
   el.dataset.s = s; el.textContent = txt;
   const cl = $('#cloudLine'); if (cl) cl.textContent = txt + '.';
 }
-window.addEventListener('online', () => { flush(); wipeManagerCache(); });
+window.addEventListener('online', () => { signInAnon(); flush(); wipeManagerCache(); });
 // Offline cache, so scans made while the internet is down still save later.
 function makeDb(app) {
   const fs = cloud.fs;
@@ -1835,6 +1835,27 @@ async function wipeManagerCache() {
     if (!cloud.db) cloud.db = makeDb(cloud.app);
   } finally { wiping = false; flush(); keepWarm(); }
 }
+/* Every station signs in to Firebase on its own (anonymously) whenever no
+   manager is signed in, including right after a manager signs out. If the
+   store Wi-Fi drops at that moment the sign-in fails, and until it works
+   scans can't save and ban checks are skipped. Keep trying on our own
+   (3s, 6s, 12s ... then once a minute) instead of waiting for a refresh. */
+let anonTry = 0, anonTimer = 0, anonBusy = false;
+function signInAnon() {
+  if (!cloud.auth || cloud.user || anonBusy) return;
+  clearTimeout(anonTimer); anonTimer = 0;
+  anonBusy = true;
+  cloud.au.signInAnonymously(cloud.auth)
+    .then(() => { anonTry = 0; }) // onAuthStateChanged takes it from here
+    .catch(err => {
+      cloud.state = 'error'; cloud.err = err.code || 'sign-in failed';
+      const wait = Math.min(60000, 3000 * 2 ** Math.min(anonTry++, 5));
+      console.warn('ID Check: Firebase sign-in failed, trying again in ' + wait / 1000 + 's', err);
+      anonTimer = setTimeout(signInAnon, wait);
+      renderCloud(); renderManagerView();
+    })
+    .finally(() => { anonBusy = false; });
+}
 async function initCloud() {
   if (!FIREBASE_CONFIG) { renderCloud(); renderManagerView(); return; }
   try {
@@ -1845,8 +1866,12 @@ async function initCloud() {
     Object.assign(cloud, { fs, au, app, db, auth: au.getAuth(app), state: 'on' });
     au.onAuthStateChanged(cloud.auth, user => {
       cloud.user = user;
-      if (!user) au.signInAnonymously(cloud.auth).catch(err => { cloud.state = 'error'; cloud.err = err.code || 'sign-in failed'; renderCloud(); });
-      else { cloud.state = 'on'; flush(); wipeManagerCache(); }
+      if (!user) signInAnon();
+      else {
+        clearTimeout(anonTimer); anonTimer = 0; anonTry = 0;
+        if (cloud.state === 'error') cloud.err = ''; // the old sign-in error, not a refused save
+        cloud.state = 'on'; flush(); wipeManagerCache();
+      }
       keepWarm();
       renderCloud(); renderManagerView();
     });
@@ -1982,7 +2007,9 @@ function renderManagerView() {
   const t = VIEW_TITLE[v];
   if (!FIREBASE_CONFIG) return gate(t, 'This turns on once Firebase is connected. Add the Firebase config at the top of the page code (look for FIREBASE_CONFIG).');
   if (cloud.state === 'error' && !cloud.auth) return gate(t, 'Firebase didn’t load. Check the internet connection and refresh.');
-  if (!cloud.auth || !cloud.user) return gate(t, 'Connecting to Firebase…');
+  if (!cloud.auth || !cloud.user) return gate(t, cloud.state === 'error'
+    ? 'Can’t reach Firebase (' + cloud.err + '). It keeps trying on its own. If this doesn’t clear in a minute or two, check the store internet.'
+    : 'Connecting to Firebase…');
   if (cloud.user.isAnonymous) return gate(t, GATE_TEXT[v], true);
   if (!isManager(cloud.user)) return gate(t, cloud.user.email + ' isn’t on the manager list.', false, true);
   $('#viewGate').hidden = true;
@@ -2064,6 +2091,7 @@ setInterval(() => {
   const u = cloud.user;
   if (u && !u.isAnonymous && S.store && mgrIdleMs() > MGR_IDLE_MS) { signOutMgr(); if (viewName() !== 'scan') location.hash = ''; }
   else wipeManagerCache(); // retry a wipe that had to wait
+  if (!cloud.user) signInAnon(); // backup for the sign-in retry timer
   if (pending.length) flush(); // retry scans that haven't saved yet
   keepWarm(); // reopen the keep-warm listener if it was dropped
 }, 30000);
